@@ -1,4 +1,5 @@
 #include <Columns/ColumnConst.h>
+#include <Columns/ColumnSet.h>
 #include <Core/Settings.h>
 #include <Interpreters/ActionsDAG.h>
 #include <Interpreters/Context.h>
@@ -44,6 +45,7 @@ namespace Setting
     extern const SettingsBool query_plan_read_in_order;
     extern const SettingsBool optimize_read_in_order;
     extern const SettingsBool query_plan_reuse_storage_ordering_for_window_functions;
+    extern const SettingsBool read_in_order_split_by_key_prefix_in;
 }
 }
 
@@ -377,6 +379,139 @@ void buildSortingDAG(const QueryPlan::Node & node, std::optional<ActionsDAG> & d
             dag->removeFromOutputs(NameSet(array_joined_columns.begin(), array_joined_columns.end()));
         }
     }
+}
+
+/// Finds `in(key_column, <constant set>)` in the `and` chain of a filter expression.
+FutureSetPtr findInSetOfColumn(const ActionsDAG::Node & filter_expression, const String & key_column)
+{
+    std::stack<const ActionsDAG::Node *> stack;
+    stack.push(&filter_expression);
+
+    while (!stack.empty())
+    {
+        const auto * node = stack.top();
+        stack.pop();
+        if (node->type == ActionsDAG::ActionType::ALIAS)
+            stack.push(node->children.front());
+        else if (node->type == ActionsDAG::ActionType::FUNCTION)
+        {
+            const auto & name = node->function_base->getName();
+            if (name == "and")
+            {
+                for (const auto * arg : node->children)
+                    stack.push(arg);
+            }
+            else if (name == "in" && node->children.size() == 2)
+            {
+                const auto * column = node->children[0];
+                while (column->type == ActionsDAG::ActionType::ALIAS)
+                    column = column->children.front();
+                const auto * set_node = node->children[1];
+                if (column->type != ActionsDAG::ActionType::INPUT || column->result_name != key_column || !set_node->column)
+                    continue;
+                if (const auto * column_set = typeid_cast<const ColumnSet *>(&set_node->column->getDataColumn()))
+                    return column_set->getData();
+            }
+        }
+    }
+    return {};
+}
+
+/// The set of `WHERE <first sorting key column> IN (...)` along the chain of steps above the reading step.
+FutureSetPtr findKeyPrefixInSet(const QueryPlan::Node & node, const String & key_column)
+{
+    IQueryPlanStep * step = node.step.get();
+    if (const auto * reading = typeid_cast<const ReadFromMergeTree *>(step))
+    {
+        if (const auto prewhere_info = reading->getPrewhereInfo())
+            if (const auto * filter = prewhere_info->prewhere_actions.tryFindInOutputs(prewhere_info->prewhere_column_name))
+                if (auto set = findInSetOfColumn(*filter, key_column))
+                    return set;
+        if (const auto row_level_filter = reading->getRowLevelFilter())
+            if (const auto * filter = row_level_filter->actions.tryFindInOutputs(row_level_filter->column_name))
+                if (auto set = findInSetOfColumn(*filter, key_column))
+                    return set;
+        return {};
+    }
+
+    if (const auto * filter_step = typeid_cast<const FilterStep *>(step))
+        if (const auto * filter = filter_step->getExpression().tryFindInOutputs(filter_step->getFilterColumnName()))
+            if (auto set = findInSetOfColumn(*filter, key_column))
+                return set;
+
+    if (node.children.empty())
+        return {};
+    return findKeyPrefixInSet(*node.children.front(), key_column);
+}
+
+/// Tells the reader to read one stream per value of the first sorting key column, and in which order
+/// of sorting key columns to merge the streams. Each stream is sorted by the rest of the key and holds one
+/// value of the first column, so that column can be merged at any position: when the query orders by it
+/// right after the matched prefix, it is appended to the order used for merging.
+/// Returns the order info to use (possibly with the longer description for merging).
+InputOrderInfoPtr setSplitByKeyPrefix(
+    ReadFromMergeTree & reading, const FutureSetPtr & split_set, const ActionsDAG & dag,
+    const SortDescription & description, const InputOrderInfoPtr & input_order)
+{
+    const auto & sorting_key = reading.getStorageMetadata()->getSortingKey();
+    const auto & key_dag = sorting_key.expression->getActionsDAG();
+    const auto matches = matchTrees(key_dag.getOutputs(), dag);
+
+    /// The sorting key column a query sort column is equal to.
+    auto key_position = [&](const SortColumnDescription & column) -> std::optional<size_t>
+    {
+        if (column.collator || column.direction != input_order->direction)
+            return {};
+        const auto * node = dag.tryFindInOutputs(column.column_name);
+        if (!node)
+            return {};
+        auto it = matches.find(node);
+        if (it == matches.end() || !it->second.node || it->second.monotonicity)
+            return {};
+        for (size_t k = 0; k < sorting_key.column_names.size(); ++k)
+            if (key_dag.tryFindInOutputs(sorting_key.column_names[k]) == it->second.node)
+                return k;
+        return {};
+    };
+
+    SortDescription merge_description = input_order->sort_description_for_merging;
+    std::vector<size_t> positions;
+    bool ok = sorting_key.reverse_flags.empty() || std::ranges::none_of(sorting_key.reverse_flags, [](bool reverse) { return reverse; });
+    size_t next_rest_key = 1;
+    for (size_t i = 0; ok && i < merge_description.size(); ++i)
+    {
+        auto k = key_position(merge_description[i]);
+        /// The other key columns must follow the order of the key, which is the order of each stream.
+        ok = k && (*k == 0 ? !std::ranges::contains(positions, 0) : *k == next_rest_key++);
+        if (ok)
+            positions.push_back(*k);
+    }
+
+    if (ok && !std::ranges::contains(positions, 0) && merge_description.size() < description.size())
+    {
+        const auto & next = description[merge_description.size()];
+        if (key_position(next) == 0)
+        {
+            merge_description.push_back(next);
+            positions.push_back(0);
+        }
+    }
+
+    if (!ok)
+    {
+        reading.setSplitByKeyPrefixSet(split_set, {});
+        return input_order;
+    }
+
+    /// The first key column is a harmless tie-break when the query does not order by it.
+    if (!std::ranges::contains(positions, 0))
+        positions.push_back(0);
+    reading.setSplitByKeyPrefixSet(split_set, positions);
+
+    if (merge_description.size() == input_order->sort_description_for_merging.size())
+        return input_order;
+    return std::make_shared<InputOrderInfo>(
+        merge_description, input_order->used_prefix_of_sorting_key_size, input_order->direction, input_order->limit);
 }
 
 /// Add more functions to fixed columns.
@@ -1240,6 +1375,36 @@ InputOrderInfoPtr buildInputOrderInfo(
     FixedColumns fixed_columns;
     buildSortingDAG(node, dag, fixed_columns, limit);
 
+    /// `WHERE k IN (v1, v2, ...)` on the first sorting key column `k`: the reader splits every part
+    /// into one stream per value, and each stream is sorted by the rest of the key. So `k` can be
+    /// treated as fixed here, and the streams are merged by the rest of the ORDER BY.
+    FutureSetPtr split_set;
+    auto * split_reading = typeid_cast<ReadFromMergeTree *>(reading_node->step.get());
+    if (split_reading && dag && find_reading_ctx.joins_to_keep_in_order.empty()
+        && !split_reading->isQueryWithFinal() && !split_reading->isParallelReadingFromReplicas()
+        && split_reading->getContext()->getSettingsRef()[Setting::read_in_order_split_by_key_prefix_in])
+    {
+        const auto & key_columns = split_reading->getStorageMetadata()->getSortingKey().column_names;
+        if (!key_columns.empty())
+        {
+            bool already_fixed = false;
+            const ActionsDAG::Node * key_input = nullptr;
+            for (const auto & dag_node : dag->getNodes())
+            {
+                if (dag_node.type != ActionsDAG::ActionType::INPUT || dag_node.result_name != key_columns[0])
+                    continue;
+                key_input = &dag_node;
+                already_fixed |= fixed_columns.contains(&dag_node);
+            }
+            if (key_input && !already_fixed)
+            {
+                split_set = findKeyPrefixInSet(node, key_columns[0]);
+                if (split_set)
+                    fixed_columns.insert(key_input);
+            }
+        }
+    }
+
     if (dag && !fixed_columns.empty())
         enrichFixedColumns(*dag, fixed_columns);
 
@@ -1297,6 +1462,9 @@ InputOrderInfoPtr buildInputOrderInfo(
 
             if (!can_read)
                 return nullptr;
+
+            if (split_set)
+                order_info.input_order = setSplitByKeyPrefix(*reading, split_set, *dag, description, order_info.input_order);
 
             for (auto * join_step : find_reading_ctx.joins_to_keep_in_order)
                 join_step->keepLeftPipelineInOrder(/* disable_squashing */ true);

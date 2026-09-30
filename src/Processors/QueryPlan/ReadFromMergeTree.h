@@ -21,6 +21,8 @@ namespace DB
 {
 
 class Pipe;
+class FutureSet;
+using FutureSetPtr = std::shared_ptr<FutureSet>;
 class ParallelReadingExtension;
 
 using MergeTreeReadTaskCallback = std::function<std::optional<ParallelReadResponse>(ParallelReadRequest)>;
@@ -390,6 +392,14 @@ public:
     bool requestReadingInOrder(size_t prefix_size, int direction, size_t read_limit, size_t query_limit = 0);
     bool setVirtualRowConversions(ActionsDAG virtual_row_conversion_);
     void resetVirtualRowConversions() { virtual_row_conversion = nullptr; }
+    /// Read in order with one stream per value of `WHERE <first sorting key column> IN <set>`.
+    /// `merge_key_positions` (indexes into the sorting key) is the order the streams are merged by
+    /// inside the reading step; empty means the streams are output unmerged.
+    void setSplitByKeyPrefixSet(FutureSetPtr set, std::vector<size_t> merge_key_positions)
+    {
+        split_by_key_prefix_set = std::move(set);
+        split_merge_key_positions = std::move(merge_key_positions);
+    }
     bool readsInOrder() const;
     const InputOrderInfoPtr & getInputOrder() const { return query_info.input_order_info; }
     const SortDescription & getSortDescription() const override { return result_sort_description; }
@@ -663,6 +673,15 @@ private:
         Names required_columns,
         PoolSettings pool_settings);
 
+    Pipe readInOrderSplitByKeyPrefix(
+        RangesInDataParts && parts_with_ranges,
+        const MergeTreeIndexBuildContextPtr & index_build_context,
+        const Names & required_columns,
+        const PoolSettings & pool_settings,
+        ReadType read_type,
+        UInt64 read_limit,
+        std::optional<ActionsDAG> & out_projection);
+
     Pipe readInOrder(
         RangesInDataParts parts_with_ranges,
         const MergeTreeIndexBuildContextPtr & index_build_context,
@@ -672,7 +691,8 @@ private:
         UInt64 limit,
         /// Index of this split when reading in-order with parallel replicas; nullopt means
         /// a single pool reads the whole table (no splitting).
-        std::optional<size_t> split_index = std::nullopt);
+        std::optional<size_t> split_index = std::nullopt,
+        const MergeTreeReadTask::BlockSizeParams * block_size_override = nullptr);
 
     Pipe spreadMarkRanges(
         RangesInDataParts && parts_with_ranges,
@@ -761,6 +781,8 @@ private:
     LazyMaterializingRowsPtr lazy_materializing_rows;
 
     ExpressionActionsPtr virtual_row_conversion;
+    FutureSetPtr split_by_key_prefix_set;
+    std::vector<size_t> split_merge_key_positions;
 
     std::optional<size_t> number_of_current_replica;
 

@@ -4494,6 +4494,12 @@ Possible values:
     DECLARE(Bool, read_in_order_use_virtual_row, true, R"(
 Use virtual row while reading in order of primary key or its monotonic function fashion. It is useful when searching over multiple parts as only the parts that can actually contribute to the result are read, plus a bounded read-ahead window of at most `max_threads` parts that keeps reads parallel.
 )", 0) \
+    DECLARE(Bool, read_in_order_split_by_key_prefix_in, false, R"(
+With `WHERE k IN (v1, v2, ...)` on the first sorting key column `k`, read in order of the rest of the sorting key: every part is read as one stream per value, and the streams are merged. For example, a table ordered by `(market, time)` can stream `WHERE market IN (...) ORDER BY time` without a full sort.
+)", 0) \
+    DECLARE(UInt64, read_in_order_split_by_key_prefix_in_read_ahead_rows, 16384, R"(
+With `read_in_order_split_by_key_prefix_in`, the number of rows each value's stream reads and decompresses ahead of the merge. The streams read blocks of half this size.
+)", 0) \
     DECLARE(Bool, read_in_order_use_virtual_row_per_block, false, R"(
 When enabled together with `read_in_order_use_virtual_row`, emit a virtual row after each block read (not only at the beginning of each part).
 This allows `MergingSortedTransform` to reprioritize sources more frequently, which is useful when downstream filters discard many rows and data is distributed unevenly across parts.

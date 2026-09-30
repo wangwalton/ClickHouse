@@ -36,7 +36,12 @@
 #include <Parsers/ASTLiteral.h>
 #include <Parsers/ASTSelectQuery.h>
 #include <Interpreters/parseIdentifiersOrStringLiteralsWithSettings.h>
+#include <Columns/ColumnSet.h>
+#include <Interpreters/PreparedSets.h>
+#include <Interpreters/Set.h>
+#include <Interpreters/convertFieldToType.h>
 #include <Processors/ConcatProcessor.h>
+#include <Processors/ISimpleTransform.h>
 #include <Processors/Merges/MergingSortedTransform.h>
 #include <Processors/QueryPlan/IParameterLookup.h>
 #include <Processors/QueryPlan/IQueryPlanStep.h>
@@ -79,6 +84,7 @@
 #include <Common/JSONBuilder.h>
 #include <Common/Logger.h>
 #include <Common/SipHash.h>
+#include <Common/Stopwatch.h>
 #include <Common/checkStackSize.h>
 #include <Common/getNumberOfCPUCoresToUse.h>
 #include <Common/logger_useful.h>
@@ -320,6 +326,7 @@ namespace Setting
     extern const SettingsUInt64 preferred_block_size_bytes;
     extern const SettingsUInt64 preferred_max_column_in_block_size_bytes;
     extern const SettingsUInt64 read_in_order_two_level_merge_threshold;
+    extern const SettingsUInt64 read_in_order_split_by_key_prefix_in_read_ahead_rows;
     extern const SettingsBool split_parts_ranges_into_intersecting_and_non_intersecting_final;
     extern const SettingsBool split_intersecting_parts_ranges_into_layers_final;
     extern const SettingsBool use_constant_folding_in_index_analysis;
@@ -838,12 +845,15 @@ Pipe ReadFromMergeTree::readInOrder(
     PoolSettings pool_settings,
     ReadType read_type,
     UInt64 read_limit,
-    std::optional<size_t> split_index)
+    std::optional<size_t> split_index,
+    const MergeTreeReadTask::BlockSizeParams * block_size_override)
 {
+    const auto & read_block_size = block_size_override ? *block_size_override : block_size;
+
     /// For reading in order it makes sense to read only
     /// one range per task to reduce number of read rows.
-    const bool has_hard_limit_below_one_block = read_type != ReadType::Default && read_limit && read_limit < block_size.max_block_size_rows;
-    const bool has_soft_limit_below_one_block = read_type != ReadType::Default && query_task_size_limit && query_task_size_limit < block_size.max_block_size_rows;
+    const bool has_hard_limit_below_one_block = read_type != ReadType::Default && read_limit && read_limit < read_block_size.max_block_size_rows;
+    const bool has_soft_limit_below_one_block = read_type != ReadType::Default && query_task_size_limit && query_task_size_limit < read_block_size.max_block_size_rows;
 
     const bool use_virtual_row = virtual_row_conversion && (read_type == ReadType::InOrder || read_type == ReadType::InReverseOrder);
     const bool use_virtual_row_per_block = use_virtual_row && context->getSettingsRef()[Setting::read_in_order_use_virtual_row_per_block];
@@ -898,7 +908,7 @@ Pipe ReadFromMergeTree::readInOrder(
             reader_settings,
             required_columns,
             pool_settings,
-            block_size,
+            read_block_size,
             context);
 
         in_order_pool->setReadRangesRefiner(
@@ -938,7 +948,7 @@ Pipe ReadFromMergeTree::readInOrder(
             reader_settings,
             required_columns,
             pool_settings,
-            block_size,
+            read_block_size,
             context,
             dataflow_cache_updater);
 
@@ -1918,6 +1928,834 @@ static MarkRanges splitRangesToAvoidLargeReads(const MarkRanges & ranges, int di
     return new_ranges;
 }
 
+namespace
+{
+
+/// Keeps the rows whose `position` column equals `value`. The input is sorted by that column.
+class KeyPrefixValueFilterTransform final : public ISimpleTransform
+{
+public:
+    KeyPrefixValueFilterTransform(SharedHeader header_, size_t position_, ColumnPtr value_)
+        : ISimpleTransform(header_, header_, true), position(position_), value(std::move(value_))
+    {
+    }
+
+    String getName() const override { return "KeyPrefixValueFilterTransform"; }
+
+protected:
+    void transform(Chunk & chunk) override
+    {
+        const size_t rows = chunk.getNumRows();
+        if (rows == 0)
+            return;
+
+        const auto column = chunk.getColumns()[position]->convertToFullIfWrapped();
+        if (column->compareAt(0, 0, *value, 1) == 0 && column->compareAt(rows - 1, 0, *value, 1) == 0)
+            return;
+
+        IColumn::Filter filter(rows);
+        size_t kept = 0;
+        for (size_t i = 0; i < rows; ++i)
+        {
+            filter[i] = column->compareAt(i, 0, *value, 1) == 0;
+            kept += filter[i];
+        }
+
+        /// The chunk no longer holds every row of its granules that passed the filters so far,
+        /// so a downstream filter must not record these granules in the query condition cache.
+        chunk.getChunkInfos().extract<MarkRangesInfo>();
+
+        auto columns = chunk.detachColumns();
+        for (auto & col : columns)
+            col = col->filter(filter, kept);
+        chunk.setColumns(std::move(columns), kept);
+    }
+
+private:
+    const size_t position;
+    const ColumnPtr value;
+};
+
+/// Where a merge key goes in the packed key of a row: `bytes` wide, at bit `shift` of word `word`.
+struct SplitMergeKey
+{
+    size_t position;
+    bool is_signed;
+    size_t bytes;
+    size_t word = 0;
+    size_t shift = 0;
+};
+
+/// Packs the keys, most significant first, into 64-bit words so that comparing the words as one big unsigned
+/// number compares the keys. The low 32 bits of the last word are left for the rank of the input. Returns the
+/// number of words.
+size_t layoutSplitMergeKeys(std::vector<SplitMergeKey> & keys)
+{
+    size_t word = 0;
+    size_t used = 0;
+    for (auto & key : keys)
+    {
+        const size_t bits = key.bytes * 8;
+        if (used + bits > 64)
+        {
+            ++word;
+            used = 0;
+        }
+        key.word = word;
+        key.shift = 64 - used - bits;
+        used += bits;
+    }
+    if (used > 32)
+        ++word;
+    return word + 1;
+}
+
+template <typename T>
+void packSplitMergeKey(const char * data, size_t rows, size_t words, const SplitMergeKey & key, bool descending, UInt64 * out)
+{
+    constexpr size_t bits = sizeof(T) * 8;
+    const T sign = key.is_signed ? static_cast<T>(T(1) << (bits - 1)) : T(0);
+    const T flip = descending ? static_cast<T>(~T(0)) : T(0);
+    const T mask = sign ^ flip;
+    out += key.word;
+    for (size_t row = 0; row < rows; ++row)
+        out[row * words] |= static_cast<UInt64>(static_cast<T>(unalignedLoad<T>(data + row * sizeof(T)) ^ mask)) << key.shift;
+}
+
+/// The packed merge keys of the rows of a chunk, `words` per row (see `layoutSplitMergeKeys`).
+struct SplitMergeKeysInfo final : public ChunkInfoCloneable<SplitMergeKeysInfo>
+{
+    std::vector<UInt64> keys;
+};
+
+/// Computes the merge keys of the chunks of one input. It runs on the query threads, in parallel for
+/// all inputs, so the merge only compares precomputed keys.
+class SplitMergeKeysTransform final : public ISimpleTransform
+{
+public:
+    SplitMergeKeysTransform(SharedHeader header_, std::vector<SplitMergeKey> keys_, size_t words_, bool descending_)
+        : ISimpleTransform(header_, header_, true)
+        , keys(std::move(keys_))
+        , words(words_)
+        , descending(descending_)
+    {
+    }
+
+    String getName() const override { return "SplitMergeKeysTransform"; }
+
+protected:
+    void transform(Chunk & chunk) override
+    {
+        const size_t rows = chunk.getNumRows();
+        auto columns = chunk.detachColumns();
+        for (auto & column : columns)
+            column = column->convertToFullIfWrapped();
+
+        auto info = std::make_shared<SplitMergeKeysInfo>();
+        info->keys.resize(rows * words);
+        for (const auto & key : keys)
+        {
+            const auto & column = *columns[key.position];
+            if (column.sizeOfValueIfFixed() != key.bytes)
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Merge key {} has {} bytes, expected {}", key.position, column.sizeOfValueIfFixed(), key.bytes);
+            const char * data = column.getRawData().data();
+            switch (key.bytes)
+            {
+                case 1: packSplitMergeKey<UInt8>(data, rows, words, key, descending, info->keys.data()); break;
+                case 2: packSplitMergeKey<UInt16>(data, rows, words, key, descending, info->keys.data()); break;
+                case 4: packSplitMergeKey<UInt32>(data, rows, words, key, descending, info->keys.data()); break;
+                case 8: packSplitMergeKey<UInt64>(data, rows, words, key, descending, info->keys.data()); break;
+                default: throw Exception(ErrorCodes::LOGICAL_ERROR, "Unsupported merge key size {}", key.bytes);
+            }
+        }
+        chunk.setColumns(std::move(columns), rows);
+        chunk.getChunkInfos().add(std::move(info));
+    }
+
+private:
+    const std::vector<SplitMergeKey> keys;
+    const size_t words;
+    const bool descending;
+};
+
+/// A chunk of one input held by the merge.
+struct SplitMergeBuffer
+{
+    Columns columns;
+    std::vector<const char *> raw; /// Data of fixed-size columns, nullptr for the others.
+    std::vector<UInt64> keys;
+    size_t rows = 0;
+};
+
+/// A merged block before its columns are copied: row `row` of buffer `slots[slot]`, for each output row.
+struct SplitMergedRowsInfo final : public ChunkInfoCloneable<SplitMergedRowsInfo>
+{
+    struct Record
+    {
+        UInt32 slot;
+        UInt32 row;
+    };
+
+    std::vector<std::shared_ptr<const SplitMergeBuffer>> slots;
+    std::vector<Record> records;
+};
+
+/// Merges inputs that are each sorted by the merge keys (see `SplitMergeKeysTransform`) into one sorted
+/// stream, the way a client merges one streaming query per market:
+/// - every input reads ahead (and decompresses) up to `read_ahead_rows` rows, so the readers of all inputs
+///   run in parallel on the query threads while the merge runs;
+/// - the merge is a tree of losers over an array holding only the current packed key of each input, so a row
+///   costs log2(inputs) branchless multi-word compares within a few KiB;
+/// - inputs are ordered by the split key value, so the input number breaks ties instead of that key;
+/// - the output holds only which rows to take (`SplitMergedRowsInfo`); `SplitGatherTransform` copies the
+///   columns on another thread while the next block is merged.
+class SplitMergingTransform final : public IProcessor
+{
+public:
+    static constexpr size_t MAX_WORDS = 5;
+
+    SplitMergingTransform(SharedHeader header_, size_t num_inputs, size_t words_, bool descending, size_t read_ahead_rows_, size_t max_block_size_)
+        : IProcessor(InputPorts(num_inputs, header_), {std::make_shared<const Block>()})
+        , words(words_)
+        , read_ahead_rows(std::max<size_t>(read_ahead_rows_, 1))
+        , max_block_size(std::max<size_t>(max_block_size_, 1))
+        , states(num_inputs)
+        , cursors(num_inputs)
+        , keys(num_inputs * words_)
+        , tree(num_inputs)
+        , waiting(num_inputs)
+    {
+        if (words == 0 || words > MAX_WORDS)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "SplitMergingTransform supports 1 to {} key words, got {}", MAX_WORDS, words);
+        input_ports.reserve(num_inputs);
+        for (auto & input : inputs)
+        {
+            port_index.emplace(&input, input_ports.size());
+            input_ports.push_back(&input);
+        }
+        for (size_t i = 0; i < num_inputs; ++i)
+            cursors[i].rank = descending ? num_inputs - 1 - i : i;
+    }
+
+    String getName() const override { return "SplitMergingTransform"; }
+
+    ~SplitMergingTransform() override
+    {
+        LOG_TRACE(getLogger("SplitMergingTransform"), "inputs {}, rows {}, output blocks {}, stopped on an empty input {}, work calls {}, ms: add chunks {}, merge {}",
+            states.size(), stat_rows, stat_blocks, stat_stalls, stat_work, stat_add_ns / 1000000, stat_merge_ns / 1000000);
+    }
+
+    Status prepare(const UpdatedInputPorts & updated_inputs, const UpdatedOutputPorts &) override
+    {
+        auto & output = outputs.front();
+        if (output.isFinished())
+        {
+            for (auto * input : input_ports)
+                input->close();
+            return Status::Finished;
+        }
+
+        if (!started)
+        {
+            started = true;
+            for (auto * input : input_ports)
+                input->setNeeded();
+        }
+        for (auto * input : updated_inputs)
+            handleInput(port_index.at(input));
+        for (size_t i : to_request)
+        {
+            states[i].request_queued = false;
+            handleInput(i);
+        }
+        to_request.clear();
+
+        if (output_chunk)
+        {
+            if (!output.canPush())
+                return Status::PortFull;
+            output.push(std::move(*output_chunk));
+            output_chunk.reset();
+        }
+
+        if (!pending.empty())
+            return Status::Ready;
+        if (done)
+        {
+            output.finish();
+            return Status::Finished;
+        }
+        if (waiting == 0)
+            return output.canPush() ? Status::Ready : Status::PortFull;
+        return Status::NeedData;
+    }
+
+    void work() override
+    {
+        ++stat_work;
+        Stopwatch watch;
+        for (auto & [input, chunk] : pending)
+            addChunk(input, std::move(chunk));
+        pending.clear();
+        stat_add_ns += watch.elapsedNanoseconds();
+
+        if (waiting == 0 && !done)
+        {
+            switch (words)
+            {
+                case 1: merge<1>(); break;
+                case 2: merge<2>(); break;
+                case 3: merge<3>(); break;
+                case 4: merge<4>(); break;
+                case 5: merge<5>(); break;
+                default: throw Exception(ErrorCodes::LOGICAL_ERROR, "Unsupported number of key words {}", words);
+            }
+        }
+    }
+
+private:
+    struct InputState
+    {
+        std::deque<std::shared_ptr<SplitMergeBuffer>> queue;
+        size_t buffered_rows = 0; /// Rows in `queue` (including consumed rows of its front) and `pending`.
+        size_t pending_chunks = 0;
+        bool finished = false;
+        bool request_queued = false;
+    };
+
+    /// Where an input is in its front buffer. The current key itself is in `keys`.
+    struct Cursor
+    {
+        const UInt64 * next = nullptr;
+        const UInt64 * end = nullptr;
+        UInt64 rank = 0; /// Order of the input among inputs, in the low bits of the last key word.
+        UInt32 row = 0;
+        UInt32 slot = 0;
+        UInt32 slot_epoch = 0;
+    };
+
+    /// An input blocks the merge while it has no rows and more may come.
+    static bool blocking(const InputState & state) { return state.queue.empty() && !(state.finished && state.pending_chunks == 0); }
+
+    void handleInput(size_t i)
+    {
+        auto & state = states[i];
+        if (state.finished)
+            return;
+        auto & input = *input_ports[i];
+        if (input.hasData())
+        {
+            Chunk chunk = input.pull(true);
+            if (chunk.getNumRows())
+            {
+                state.buffered_rows += chunk.getNumRows();
+                ++state.pending_chunks;
+                pending.emplace_back(i, std::move(chunk));
+            }
+        }
+        if (input.isFinished())
+        {
+            bool was_blocking = blocking(state);
+            state.finished = true;
+            if (was_blocking && !blocking(state))
+                --waiting;
+            return;
+        }
+        if (state.buffered_rows < read_ahead_rows)
+            input.setNeeded();
+        else
+            input.setNotNeeded();
+    }
+
+    void addChunk(size_t i, Chunk chunk)
+    {
+        auto info = chunk.getChunkInfos().extract<SplitMergeKeysInfo>();
+        if (!info || info->keys.size() != chunk.getNumRows() * words)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "SplitMergingTransform expects merge keys for each chunk");
+
+        auto buffer = std::make_shared<SplitMergeBuffer>();
+        buffer->rows = chunk.getNumRows();
+        buffer->columns = chunk.detachColumns();
+        buffer->keys = std::move(info->keys);
+        buffer->raw.resize(buffer->columns.size());
+        for (size_t c = 0; c < buffer->columns.size(); ++c)
+            if (buffer->columns[c]->isFixedAndContiguous())
+                buffer->raw[c] = buffer->columns[c]->getRawData().data();
+
+        auto & state = states[i];
+        --state.pending_chunks;
+        state.queue.push_back(std::move(buffer));
+        if (state.queue.size() == 1)
+        {
+            loadCursor(i);
+            --waiting;
+        }
+    }
+
+    /// Points the cursor of input `i` at the first row of its front buffer.
+    void loadCursor(size_t i)
+    {
+        const auto & buffer = *states[i].queue.front();
+        auto & cursor = cursors[i];
+        for (size_t w = 0; w < words; ++w)
+            keys[i * words + w] = buffer.keys[w];
+        keys[i * words + words - 1] |= cursor.rank;
+        cursor.next = buffer.keys.data() + words;
+        cursor.end = buffer.keys.data() + buffer.rows * words;
+        cursor.row = 0;
+        cursor.slot_epoch = 0;
+    }
+
+    /// An exhausted input: all words are the maximum, above any row since row ranks are smaller.
+    void setExhausted(size_t i) { std::fill_n(keys.data() + i * words, words, std::numeric_limits<UInt64>::max()); }
+
+    /// Called when input `i` used up its front buffer. Returns false if the merge must wait for its next chunk.
+    bool nextBuffer(size_t i)
+    {
+        auto & state = states[i];
+        state.buffered_rows -= state.queue.front()->rows;
+        state.queue.pop_front();
+        if (!state.finished && state.buffered_rows < read_ahead_rows && !state.request_queued)
+        {
+            state.request_queued = true;
+            to_request.push_back(i);
+        }
+        if (!state.queue.empty())
+        {
+            loadCursor(i);
+            return true;
+        }
+        if (blocking(state))
+        {
+            ++waiting;
+            return false;
+        }
+        setExhausted(i);
+        return true;
+    }
+
+    /// Whether `a` < `b` as big unsigned numbers of W words, most significant first: the borrow of `a` - `b`.
+    template <size_t W>
+    static ALWAYS_INLINE bool less(const UInt64 * a, const UInt64 * b)
+    {
+        unsigned long long borrow = 0;
+        for (size_t w = W; w-- > 0;)
+            __builtin_subcll(a[w], b[w], borrow, &borrow);
+        return borrow;
+    }
+
+    /// Plays input `winner`, whose key changed, from its leaf to the root. The winner's key is kept in registers,
+    /// so the loads of the nodes on the path do not wait for the compares below them.
+    template <size_t W>
+    ALWAYS_INLINE void replay(UInt32 winner)
+    {
+        const size_t n = tree.size();
+        UInt32 * nodes = tree.data();
+        const UInt64 * all_keys = keys.data();
+        UInt64 key[W];
+        for (size_t w = 0; w < W; ++w)
+            key[w] = all_keys[winner * W + w];
+        for (size_t node = (winner + n) >> 1; node > 0; node >>= 1)
+        {
+            const UInt32 other = nodes[node];
+            const UInt64 * other_key = all_keys + other * W;
+            const bool swap = less<W>(other_key, key);
+            nodes[node] = swap ? winner : other;
+            winner = swap ? other : winner;
+            for (size_t w = 0; w < W; ++w)
+                key[w] = swap ? other_key[w] : key[w];
+        }
+        nodes[0] = winner;
+    }
+
+    /// Node `node` > 0 holds the loser of its two subtrees; leaf of input `i` is node `n + i`.
+    template <size_t W>
+    void build()
+    {
+        const size_t n = tree.size();
+        for (size_t i = 0; i < n; ++i)
+            if (states[i].queue.empty())
+                setExhausted(i);
+        std::vector<UInt32> winners(n);
+        auto winner_of = [&](size_t node) { return node >= n ? static_cast<UInt32>(node - n) : winners[node]; };
+        for (size_t node = n - 1; node > 0; --node)
+        {
+            const UInt32 left = winner_of(2 * node);
+            const UInt32 right = winner_of(2 * node + 1);
+            const bool right_wins = less<W>(keys.data() + right * W, keys.data() + left * W);
+            winners[node] = right_wins ? right : left;
+            tree[node] = right_wins ? left : right;
+        }
+        tree[0] = winner_of(1);
+    }
+
+    template <size_t W>
+    void merge()
+    {
+        Stopwatch watch;
+        if (!built)
+        {
+            build<W>();
+            built = true;
+        }
+        else if (resume)
+        {
+            /// The winner ran out of rows and was waiting for its next chunk.
+            const UInt32 winner = tree[0];
+            if (states[winner].queue.empty())
+                setExhausted(winner);
+            replay<W>(winner);
+        }
+        resume = false;
+
+        auto info = std::make_shared<SplitMergedRowsInfo>();
+        auto & records = info->records;
+        auto & slots = info->slots;
+        records.reserve(max_block_size);
+        ++epoch;
+        while (records.size() < max_block_size)
+        {
+            const UInt32 winner = tree[0];
+            UInt64 * key = keys.data() + winner * W;
+            if (key[W - 1] == std::numeric_limits<UInt64>::max())
+            {
+                done = true;
+                break;
+            }
+
+            auto & cursor = cursors[winner];
+            if (cursor.slot_epoch != epoch)
+            {
+                cursor.slot_epoch = epoch;
+                cursor.slot = static_cast<UInt32>(slots.size());
+                slots.push_back(states[winner].queue.front());
+            }
+            records.push_back({cursor.slot, cursor.row});
+
+            if (cursor.next != cursor.end)
+            {
+                /// With hundreds of inputs the hardware prefetcher does not follow each key stream.
+                __builtin_prefetch(cursor.next + 16);
+                for (size_t w = 0; w < W; ++w)
+                    key[w] = cursor.next[w];
+                key[W - 1] |= cursor.rank;
+                cursor.next += W;
+                ++cursor.row;
+            }
+            else if (!nextBuffer(winner))
+            {
+                resume = true;
+                break;
+            }
+            replay<W>(winner);
+        }
+
+        stat_stalls += resume;
+        stat_rows += records.size();
+        stat_merge_ns += watch.elapsedNanoseconds();
+        if (!records.empty())
+        {
+            ++stat_blocks;
+            const size_t rows = records.size();
+            output_chunk.emplace(Columns{}, rows);
+            output_chunk->getChunkInfos().add(std::move(info));
+        }
+    }
+
+    const size_t words; /// Words of a packed key.
+    const size_t read_ahead_rows;
+    const size_t max_block_size;
+
+    std::vector<InputPort *> input_ports;
+    std::unordered_map<const InputPort *, size_t> port_index;
+    std::vector<InputState> states;
+    std::vector<Cursor> cursors;
+    std::vector<UInt64> keys; /// Current packed key of each input, with its rank.
+    std::vector<UInt32> tree;
+    size_t waiting;
+    bool started = false;
+    bool built = false;
+    bool resume = false;
+    bool done = false;
+
+    std::vector<std::pair<size_t, Chunk>> pending;
+    std::vector<size_t> to_request;
+    UInt32 epoch = 0;
+    size_t stat_rows = 0;
+    size_t stat_blocks = 0;
+    size_t stat_stalls = 0;
+    size_t stat_work = 0;
+    UInt64 stat_add_ns = 0;
+    UInt64 stat_merge_ns = 0;
+    std::optional<Chunk> output_chunk;
+};
+
+/// Copies the rows chosen by `SplitMergingTransform` into columns.
+class SplitGatherTransform final : public ISimpleTransform
+{
+public:
+    SplitGatherTransform(SharedHeader input_header_, SharedHeader output_header_)
+        : ISimpleTransform(input_header_, output_header_, false)
+    {
+    }
+
+    String getName() const override { return "SplitGatherTransform"; }
+
+    ~SplitGatherTransform() override
+    {
+        LOG_TRACE(getLogger("SplitGatherTransform"), "ms: gather {}", stat_ns / 1000000);
+    }
+
+protected:
+    void transform(Chunk & chunk) override
+    {
+        Stopwatch watch;
+        auto info = chunk.getChunkInfos().extract<SplitMergedRowsInfo>();
+        if (!info)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "SplitGatherTransform expects merged rows");
+        const auto & records = info->records;
+        const auto & slots = info->slots;
+        const size_t rows = records.size();
+
+        MutableColumns columns = getOutputPort().getHeader().cloneEmptyColumns();
+        for (size_t c = 0; c < columns.size(); ++c)
+        {
+            auto & dst = *columns[c];
+            slot_raw.resize(slots.size());
+            bool fixed = dst.isFixedAndContiguous();
+            for (size_t slot = 0; slot < slots.size(); ++slot)
+            {
+                slot_raw[slot] = slots[slot]->raw[c];
+                fixed = fixed && slot_raw[slot] != nullptr;
+            }
+            const size_t size = fixed ? dst.sizeOfValueIfFixed() : 0;
+
+            if (size == 1 || size == 2 || size == 4 || size == 8 || size == 16)
+            {
+                dst.insertManyDefaults(rows);
+                char * data = const_cast<char *>(dst.getRawData().data());
+                switch (size)
+                {
+                    case 1: copyFixed<UInt8>(records, data); break;
+                    case 2: copyFixed<UInt16>(records, data); break;
+                    case 4: copyFixed<UInt32>(records, data); break;
+                    case 8: copyFixed<UInt64>(records, data); break;
+                    case 16: copyFixed<UInt128>(records, data); break;
+                    default: break;
+                }
+                continue;
+            }
+
+            dst.reserve(rows);
+            for (size_t r = 0; r < rows;)
+            {
+                /// Copy runs of consecutive rows of one buffer at once.
+                size_t end = r + 1;
+                while (end < rows && records[end].slot == records[r].slot && records[end].row == records[end - 1].row + 1)
+                    ++end;
+                const IColumn & src = *slots[records[r].slot]->columns[c];
+                if (end - r == 1)
+                    dst.insertFrom(src, records[r].row);
+                else
+                    dst.insertRangeFrom(src, records[r].row, end - r);
+                r = end;
+            }
+        }
+        chunk.setColumns(std::move(columns), rows);
+        stat_ns += watch.elapsedNanoseconds();
+    }
+
+private:
+    template <typename T>
+    void copyFixed(const std::vector<SplitMergedRowsInfo::Record> & records, char * dst) const
+    {
+        T * out = reinterpret_cast<T *>(dst);
+        for (const auto & record : records)
+            *out++ = unalignedLoad<T>(slot_raw[record.slot] + record.row * sizeof(T));
+    }
+
+    std::vector<const char *> slot_raw; /// Data of one column of each slot, while gathering.
+    UInt64 stat_ns = 0;
+};
+
+/// Whether a key column can be merged by `SplitMergingTransform`, and if its values are signed.
+std::optional<bool> splitMergeKeySigned(const DataTypePtr & type)
+{
+    WhichDataType which(type);
+    if (which.isNativeUInt() || which.isDate() || which.isDateTime())
+        return false;
+    if (which.isNativeInt() || which.isDate32() || which.isDateTime64() || which.isDecimal32() || which.isDecimal64() || which.isEnum8() || which.isEnum16())
+        return true;
+    return {};
+}
+
+}
+
+Pipe ReadFromMergeTree::readInOrderSplitByKeyPrefix(
+    RangesInDataParts && parts_with_ranges,
+    const MergeTreeIndexBuildContextPtr & index_build_context,
+    const Names & required_columns,
+    const PoolSettings & pool_settings,
+    ReadType read_type,
+    UInt64 read_limit,
+    std::optional<ActionsDAG> & out_projection)
+{
+    if (is_parallel_reading_from_replicas)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Reading split by key prefix values is not supported with parallel replicas");
+
+    SetPtr set = split_by_key_prefix_set->get();
+    if (!set || !set->hasExplicitSetElements())
+        set = split_by_key_prefix_set->buildOrderedSetInplace(context);
+    if (!set || !set->hasExplicitSetElements())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "The set for reading split by key prefix values is not built");
+
+    const Columns elements = set->getSetElements();
+    if (elements.size() != 1)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Expected a single column set, got {} columns", elements.size());
+
+    const auto & sorting_key = storage_snapshot->metadata->getSortingKey();
+    const String & key_column = sorting_key.column_names.at(0);
+    const DataTypePtr & key_type = sorting_key.data_types.at(0);
+
+    std::vector<Field> values;
+    values.reserve(elements[0]->size());
+    for (size_t i = 0; i < elements[0]->size(); ++i)
+    {
+        Field value = convertFieldToType((*elements[0])[i], *key_type);
+        if (!value.isNull())
+            values.push_back(std::move(value));
+    }
+    std::ranges::sort(values);
+    values.erase(std::unique(values.begin(), values.end()), values.end());
+
+    /// Granule `i` holds keys in [index[i], index[i + 1]], so the granules of value `v` are
+    /// [lower_bound(v) - 1, upper_bound(v)), intersected with the ranges selected by the filter.
+    std::vector<RangesInDataParts> parts_by_value(values.size());
+    for (const auto & part : parts_with_ranges)
+    {
+        const auto index = part.data_part->getIndex();
+        if (!index || index->empty())
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Part {} has no primary index", part.data_part->name);
+        const IColumn & key_index = *index->at(0);
+        const size_t granules = part.data_part->index_granularity->getMarksCountWithoutFinal();
+        if (key_index.size() < granules)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Part {} has {} index marks for {} granules", part.data_part->name, key_index.size(), granules);
+
+        std::vector<Field> marks(granules);
+        for (size_t i = 0; i < granules; ++i)
+            key_index.get(i, marks[i]);
+
+        for (size_t v = 0; v < values.size(); ++v)
+        {
+            const size_t lower = std::lower_bound(marks.begin(), marks.end(), values[v]) - marks.begin();
+            const size_t upper = std::upper_bound(marks.begin(), marks.end(), values[v]) - marks.begin();
+            const size_t begin = lower == 0 ? 0 : lower - 1;
+            if (upper == 0)
+                continue;
+
+            MarkRanges ranges;
+            for (const auto & range : part.ranges)
+            {
+                const size_t range_begin = std::max(range.begin, begin);
+                const size_t range_end = std::min(range.end, upper);
+                if (range_begin < range_end)
+                    ranges.emplace_back(range_begin, range_end);
+            }
+            if (ranges.empty())
+                continue;
+
+            parts_by_value[v].emplace_back(
+                part.data_part, part.parent_part, part.part_index_in_query, part.part_starting_offset_in_query, ranges, part.read_hints);
+        }
+    }
+
+    const size_t read_ahead_rows = context->getSettingsRef()[Setting::read_in_order_split_by_key_prefix_in_read_ahead_rows];
+    auto value_block_size = block_size;
+    /// Blocks of half the read-ahead, so one block is merged while the next is read.
+    value_block_size.max_block_size_rows = std::min<UInt64>(value_block_size.max_block_size_rows, std::max<size_t>(read_ahead_rows / 2, 1));
+
+    Pipes pipes;
+    for (size_t v = 0; v < values.size(); ++v)
+    {
+        if (parts_by_value[v].empty())
+            continue;
+
+        Pipe pipe = readInOrder(
+            std::move(parts_by_value[v]), index_build_context, required_columns, pool_settings, read_type, read_limit,
+            /*split_index=*/std::nullopt, &value_block_size);
+        if (pipe.empty())
+            continue;
+
+        const auto & header = pipe.getHeader();
+        const size_t position = header.getPositionByName(key_column);
+        auto value = header.getByPosition(position).type->createColumnConst(1, values[v])->convertToFullColumnIfConst();
+        pipe.addSimpleTransform([position, value](const SharedHeader & stream_header)
+            { return std::make_shared<KeyPrefixValueFilterTransform>(stream_header, position, value); });
+        pipes.emplace_back(std::move(pipe));
+    }
+
+    LOG_DEBUG(log, "Reading in order split by {} values of {}: {} streams", values.size(), key_column, pipes.size());
+    if (pipes.empty())
+        return {};
+
+    Pipe pipe = Pipe::unitePipes(std::move(pipes));
+    if (split_merge_key_positions.empty())
+        return pipe;
+
+    /// Compute the sorting key columns the merge needs (e.g. an expression in the key), and drop them afterwards.
+    const Block header_before_keys = pipe.getHeader();
+    const size_t prefix_size = *std::ranges::max_element(split_merge_key_positions) + 1;
+    auto order_key_prefix_ast = sorting_key.expression_list_ast->clone();
+    order_key_prefix_ast->children.resize(prefix_size);
+    auto syntax_result = TreeRewriter(context).analyze(
+        order_key_prefix_ast, storage_snapshot->metadata->getColumns().get(GetColumnsOptions(GetColumnsOptions::AllPhysical).withSubcolumns()));
+    auto sorting_key_expr = std::make_shared<ExpressionActions>(ExpressionAnalyzer(order_key_prefix_ast, syntax_result, context).getActionsDAG(false));
+    pipe.addSimpleTransform([sorting_key_expr](const SharedHeader & stream_header)
+        { return std::make_shared<ExpressionTransform>(stream_header, sorting_key_expr); });
+
+    const auto & merge_header = pipe.getHeader();
+    /// The inputs are in the order of the split key values, so when the split key is the last merge key, the merge
+    /// breaks ties by input instead of comparing it.
+    auto merge_keys = std::span(split_merge_key_positions);
+    if (merge_keys.back() == 0)
+        merge_keys = merge_keys.first(merge_keys.size() - 1);
+    std::vector<SplitMergeKey> keys;
+    for (size_t key : merge_keys)
+    {
+        const auto & column = merge_header.getByName(sorting_key.column_names.at(key));
+        auto key_signed = splitMergeKeySigned(column.type);
+        if (!key_signed)
+        {
+            /// The merge above the reading step merges the streams instead.
+            LOG_DEBUG(log, "Key column {} of type {} is not merged in the reading step", column.name, column.type->getName());
+            out_projection = createProjection(header_before_keys);
+            return pipe;
+        }
+        keys.push_back({merge_header.getPositionByName(column.name), *key_signed, column.type->getSizeOfValueInMemory()});
+    }
+    const size_t words = layoutSplitMergeKeys(keys);
+    if (words > SplitMergingTransform::MAX_WORDS)
+    {
+        LOG_DEBUG(log, "{} merge keys do not fit the merge in the reading step", keys.size());
+        out_projection = createProjection(header_before_keys);
+        return pipe;
+    }
+
+    if (pipe.numOutputPorts() > 1)
+    {
+        const bool descending = query_info.input_order_info->direction < 0;
+        pipe.addSimpleTransform([&](const SharedHeader & stream_header)
+            { return std::make_shared<SplitMergeKeysTransform>(stream_header, keys, words, descending); });
+        auto merged_header = pipe.getSharedHeader();
+        pipe.addTransform(std::make_shared<SplitMergingTransform>(
+            merged_header, pipe.numOutputPorts(), words, descending, read_ahead_rows, block_size.max_block_size_rows));
+        pipe.addSimpleTransform([&](const SharedHeader & stream_header)
+            { return std::make_shared<SplitGatherTransform>(stream_header, merged_header); });
+    }
+    out_projection = createProjection(header_before_keys);
+    return pipe;
+}
+
 Pipe ReadFromMergeTree::spreadMarkRangesAmongStreamsWithOrder(
     RangesInDataParts && parts_with_ranges,
     const MergeTreeIndexBuildContextPtr & index_build_context,
@@ -1989,6 +2827,15 @@ Pipe ReadFromMergeTree::spreadMarkRangesAmongStreamsWithOrder(
         .use_uncompressed_cache = info.use_uncompressed_cache,
         .total_query_nodes = total_query_nodes,
     };
+
+    if (split_by_key_prefix_set)
+    {
+        Pipe pipe = readInOrderSplitByKeyPrefix(
+            std::move(parts_with_ranges), index_build_context, column_names, pool_settings, read_type, input_order_info->limit, out_projection);
+        if (!pipe.empty() && !out_projection && have_input_columns_removed_after_prewhere)
+            out_projection = createProjection(pipe.getHeader());
+        return pipe;
+    }
 
     const bool is_local_plan_initiator = isParallelReplicasLocalPlanForInitiator();
     /// Split-stream topology requires both sides to speak the announcement-response protocol so
