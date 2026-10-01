@@ -116,3 +116,6 @@ Beyond the plan, found by profiling:
   at 3 threads on NRA A 24 h.
 
 Not reached: memory on wide 24 h reads is 1.5–2× the sort (README "Floors").
+
+Afterwards: the stock sort as 8 concurrent time slices reaches 12.4 s on 5,000 random / 24 h (patch
+8.5 s, one-query sort 34.3 s), so the patch stays parked (README "Status").

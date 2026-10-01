@@ -1,8 +1,8 @@
 # Streaming time-ordered reads over many key prefixes (`read_in_order_split_by_key_prefix_in`)
 
-Experimental patch on v26.9.6.6-stable, 2026-09-30, optimized 2026-10-01. It beats or ties the
-full sort, a time-first table and bucket layouts on every measured workload. This file records what
-it does, why, what was measured, and what is left.
+Experimental patch on v26.9.6.6-stable, 2026-09-30, optimized 2026-10-01. Status: **parked**. It
+beats or ties the full sort, a time-first table and bucket layouts on every measured workload, but a
+stock sort split into concurrent time slices gets most of the gain without a fork (see Status).
 
 ## Problem
 
@@ -148,10 +148,16 @@ ahead per group instead of 1 (no change).
   The read-ahead is a latency/memory trade (`read_in_order_split_by_key_prefix_in_read_ahead_rows`);
   time-first stays at ~0.3 GiB on every workload.
 
-## Status
+## Status: parked
 
 Beats or ties every alternative on every workload above (all_wide excluded: time-first is the
-answer there). Not upstreamed; the fork branch push needs a token with `workflow` scope.
+answer there). Still parked, because the stock sort gets most of the way without a fork: a full sort
+reads and sorts blocks in parallel, then streams one k-way merge whose last 16 → 1 step is
+single-threaded. Run as concurrent time slices (one sorted query per slice, read in order), the merge
+is parallel: 5,000 random / 24 h takes 12.4 s with 8 slices of 3 h (4.3 GiB summed) against 34.3 s
+for one query and 8.5 s (7.6 GiB) for the patch. On the motivating workload (NRA A 24 h) the patch
+is 1.84 s vs 2.08 s. This build has the JIT off; prod's JIT compiles the sort's comparisons, so the
+stock sort is likely closer still. Details: markets-v2 `docs/replay-regions/measurements.md`.
 
 ## Next steps
 
