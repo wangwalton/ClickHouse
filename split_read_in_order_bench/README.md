@@ -143,10 +143,17 @@ ahead per group instead of 1 (no change).
 - **1 market / 10 markets / 1 minute**: ties with the sort to 10 ms; what is left is pipeline setup.
 - **NRA A 24 h**: read-bound; the patch reads 4% more rows than the sort (a granule at a market
   boundary is read by both neighbours' readers when they are in different reading groups).
-- **Memory**: wide 24 h reads hold 1.5–2× the sort (5,000 random: 7.6 vs 3.9 GiB) because rows
-  wait in every stream's read-ahead (65,536 rows × ~4,700 streams) and carry 16 B of packed key each.
-  The read-ahead is a latency/memory trade (`read_in_order_split_by_key_prefix_in_read_ahead_rows`);
-  time-first stays at ~0.3 GiB on every workload.
+- **Memory**: wide 24 h reads hold ~2× the sort, which holds every row once. 5,000 random / 24 h
+  returns 156 M rows: the sort peaks at 3.9 GiB (~27 B/row), the patch at 7.3 GiB (~50 B/row).
+  - The read-ahead holds nearly the whole day. It is 65,536 rows per market, and the average market
+    has 156 M / 5,000 ≈ 31 k rows in 24 h, so most markets read their entire day in one read-ahead.
+    The first-level merges' largest buffers add up to 124 M rows (80% of all rows).
+  - Most rows are held twice. Rows gathered by a first-level merge wait in `SplitBatchingTransform`
+    until every group has read past them, while the read chunks they came from stay buffered in the
+    first-level merge. This split is inferred from 27 vs 50 B/row, not measured per stage.
+  - Lowering the read-ahead does not help: 32,768 rows is still about a market's day (−10% memory),
+    and 4,096 costs 23% in time.
+  - Time-first stays at ~0.3 GiB on every workload.
 
 ## Status: parked
 
@@ -161,7 +168,9 @@ stock sort is likely closer still. Details: markets-v2 `docs/replay-regions/meas
 
 ## Next steps
 
-1. Memory on wide reads: a byte budget for read-ahead shared by all streams instead of rows per stream.
+1. Memory on wide reads: every stream reads only up to a shared time cutoff (e.g. the next 5
+   minutes) instead of a row count. The batching stage then holds rows up to that cutoff only, and
+   memory follows the active window rather than the range.
 2. Merge boundary granules of neighbouring reading groups (the NRA A extra 4%).
 3. Several tables: one patched query per table, streams merged on the client.
 4. Upstream rather than carry a fork.
