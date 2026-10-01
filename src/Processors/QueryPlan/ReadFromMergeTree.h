@@ -692,7 +692,9 @@ private:
         /// Index of this split when reading in-order with parallel replicas; nullopt means
         /// a single pool reads the whole table (no splitting).
         std::optional<size_t> split_index = std::nullopt,
-        const MergeTreeReadTask::BlockSizeParams * block_size_override = nullptr);
+        const MergeTreeReadTask::BlockSizeParams * block_size_override = nullptr,
+        /// With `block_size_override`: the most rows of a block of each part's stream.
+        std::vector<size_t> block_rows_per_part = {});
 
     Pipe spreadMarkRanges(
         RangesInDataParts && parts_with_ranges,

@@ -195,6 +195,8 @@ public:
         MergeTreeBlockSizePredictorPtr size_predictor_,
         RuntimeDataflowStatisticsCacheUpdaterPtr updater_);
 
+    void setMaxBlockSizeRows(UInt64 rows) { block_size_params.max_block_size_rows = rows; }
+
     void initializeReadersChain(
         const PrewhereExprInfo & prewhere_actions,
         MergeTreeIndexBuildContextPtr index_build_context,

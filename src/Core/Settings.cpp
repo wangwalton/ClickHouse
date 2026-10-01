@@ -4498,7 +4498,10 @@ Use virtual row while reading in order of primary key or its monotonic function 
 With `WHERE k IN (v1, v2, ...)` on the first sorting key column `k`, read in order of the rest of the sorting key: every part is read as one stream per value, and the streams are merged. For example, a table ordered by `(market, time)` can stream `WHERE market IN (...) ORDER BY time` without a full sort.
 )", 0) \
     DECLARE(UInt64, read_in_order_split_by_key_prefix_in_read_ahead_rows, 65536, R"(
-With `read_in_order_split_by_key_prefix_in`, the number of rows each value's stream reads and decompresses ahead of the merge. The streams read blocks of half this size.
+With `read_in_order_split_by_key_prefix_in`, the most rows a stream reads and decompresses ahead of the merge. A stream gets a share of `read_in_order_split_by_key_prefix_in_read_ahead_bytes` by its rows, at least an eighth of this; the streams read blocks of half that.
+)", 0) \
+    DECLARE(UInt64, read_in_order_split_by_key_prefix_in_read_ahead_bytes, 536870912, R"(
+With `read_in_order_split_by_key_prefix_in`, the bytes of rows all streams together read ahead of the merge, shared by the streams in proportion to their rows (see `read_in_order_split_by_key_prefix_in_read_ahead_rows`).
 )", 0) \
     DECLARE(Bool, read_in_order_use_virtual_row_per_block, false, R"(
 When enabled together with `read_in_order_use_virtual_row`, emit a virtual row after each block read (not only at the beginning of each part).

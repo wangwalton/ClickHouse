@@ -31,6 +31,9 @@ public:
     MergeTreeReadTaskPtr getTask(size_t task_idx, MergeTreeReadTask * previous_task) override;
     void profileFeedback(ReadBufferFromFileBase::ProfileInfo) override {}
 
+    /// The most rows of a block of each part's tasks, by task index; empty: the pool's block size.
+    void setMaxBlockSizeRowsPerPart(std::vector<size_t> rows) { max_block_size_rows_per_part = std::move(rows); }
+
 private:
     /// Hard limit case (no filter): we will stop reading exactly at the limit, so always emit
     /// single-range tasks to avoid reading more rows than necessary.
@@ -45,6 +48,7 @@ private:
     RuntimeDataflowStatisticsCacheUpdaterPtr updater;
 
     std::vector<MarkRanges> per_part_mark_ranges;
+    std::vector<size_t> max_block_size_rows_per_part;
 };
 
 }

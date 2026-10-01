@@ -90,7 +90,10 @@ MergeTreeReadTaskPtr MergeTreeReadPoolInOrder::getTask(size_t task_idx, MergeTre
         if (mark_ranges_for_task.empty())
             continue;
 
-        return createTask(per_part_infos[task_idx], std::move(mark_ranges_for_task), previous_task, updater);
+        auto task = createTask(per_part_infos[task_idx], std::move(mark_ranges_for_task), previous_task, updater);
+        if (!max_block_size_rows_per_part.empty())
+            task->setMaxBlockSizeRows(max_block_size_rows_per_part.at(task_idx));
+        return task;
     }
 
     return nullptr;
