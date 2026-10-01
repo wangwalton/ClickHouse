@@ -43,6 +43,9 @@ check m_last_desc "SELECT m, ts, tie FROM t WHERE m IN $S10 ORDER BY ts DESC, ti
 check m_desc_mix "SELECT m, ts, tie FROM t WHERE m IN $S10 ORDER BY ts, tie, m DESC"
 check ra_1       "SELECT m, ts, tie, v FROM t WHERE m IN $S300 ORDER BY ts, tie, m SETTINGS read_in_order_split_by_key_prefix_in_read_ahead_rows = 1"
 check ra_100     "SELECT m, ts, tie, v FROM t WHERE m IN $S300 ORDER BY ts, tie, m SETTINGS read_in_order_split_by_key_prefix_in_read_ahead_rows = 100, max_block_size = 777"
+check all_desc   "SELECT m, ts, tie, v FROM t WHERE m IN (SELECT number FROM numbers(1000)) ORDER BY ts DESC, tie DESC"
+check all_m_desc "SELECT m, ts, tie FROM t WHERE m IN (SELECT number FROM numbers(1000)) ORDER BY ts DESC, tie DESC, m DESC"
+check all_ra_1   "SELECT m, ts, tie, v FROM t WHERE m IN (SELECT number FROM numbers(1000)) ORDER BY ts, tie, m SETTINGS read_in_order_split_by_key_prefix_in_read_ahead_rows = 1, max_block_size = 333"
 check ts_minute  "SELECT m, ts, tie FROM t WHERE m IN $S10 ORDER BY toStartOfMinute(ts), m, ts, tie"
 # Production-like: key with an ALIAS expression, Nullable and String columns.
 $C -q "DROP TABLE IF EXISTS t2" < /dev/null

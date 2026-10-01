@@ -160,13 +160,14 @@ MergeTreeSelectProcessor::MergeTreeSelectProcessor(
     const MergeTreeReaderSettings & reader_settings_,
     MergeTreeIndexBuildContextPtr merge_tree_index_build_context_,
     LazyMaterializingRowsPtr lazy_materializing_rows_,
-    const ColumnsDescription * columns_)
+    const ColumnsDescription * columns_,
+    const MergeTreeSelectProcessor * same_as_)
     : pool(std::move(pool_))
     , algorithm(std::move(algorithm_))
     , row_level_filter(row_level_filter_)
     , prewhere_info(prewhere_info_)
     , actions_settings(actions_settings_)
-    , prewhere_actions(getPrewhereActions(
+    , prewhere_actions(same_as_ ? same_as_->prewhere_actions : getPrewhereActions(
           row_level_filter,
           prewhere_info,
           index_read_tasks_,
@@ -175,7 +176,7 @@ MergeTreeSelectProcessor::MergeTreeSelectProcessor(
           reader_settings_.force_short_circuit_execution,
           columns_))
     , reader_settings(reader_settings_)
-    , result_header(transformHeader(pool->getHeader(), row_level_filter, prewhere_info))
+    , result_header(same_as_ ? same_as_->result_header : transformHeader(pool->getHeader(), row_level_filter, prewhere_info))
     , merge_tree_index_build_context(std::move(merge_tree_index_build_context_))
     , lazy_materializing_rows(std::move(lazy_materializing_rows_))
 {
@@ -407,49 +408,8 @@ ChunkAndProgress MergeTreeSelectProcessor::read()
         {
             if (!task || algorithm->needNewTask(*task))
             {
-                /// Update the query condition cache for filters in PREWHERE stage.
-                /// Skip the write when a reader earlier in the chain (skip-index or projection-index)
-                /// could have filtered marks before PREWHERE saw them, to avoid attributing those
-                /// marks to the PREWHERE predicate hash. See Issue #104781.
-                /// On-fly mutations and patch parts filter rows ahead of PREWHERE for the same reason.
-                /// A row-level security filter is also prepended before PREWHERE, yet this write keys
-                /// only on the query PREWHERE hash, so a mark hidden by a row policy must not be attributed
-                /// to the PREWHERE predicate (a later query without the policy would skip rows it should see).
-                if (reader_settings.use_query_condition_cache && task && prewhere_info
-                    && !task->readersChainCanSkipMarksBeforePrewhere()
-                    && !task->appliesMutationsBeforePrewhere()
-                    && !row_level_filter
-                    /// QueryConditionCache needs the concrete part's storage UUID; skip for borrowed parts.
-                    && task->getInfo().data_part_info->getDataPart())
-                {
-                    for (const auto * output : prewhere_info->prewhere_actions.getOutputs())
-                    {
-                        if (output->result_name == prewhere_info->prewhere_column_name)
-                        {
-                            if (!VirtualColumnUtils::isDeterministic(output))
-                                continue;
-
-                            auto query_condition_cache = Context::getGlobalContextInstance()->getQueryConditionCache();
-                            const auto & data_part_info = task->getInfo().data_part_info;
-
-                            String part_name = data_part_info->isProjectionPart()
-                                ? fmt::format("{}:{}", data_part_info->getParentPartName(), data_part_info->getPartName())
-                                : data_part_info->getPartName();
-                            query_condition_cache->write(
-                                /// QueryConditionCache is a coordinator feature; concrete part present here.
-                                data_part_info->getDataPart()->storage.getStorageID().uuid,
-                                part_name,
-                                queryConditionCacheHash(output->getHash(), reader_settings.query_condition_cache_settings_salt),
-                                prewhere_info->prewhere_actions.getNames()[0],
-                                task->getPrewhereUnmatchedMarks(),
-                                data_part_info->getIndexGranularity().getMarksCount(),
-                                data_part_info->getIndexGranularity().hasFinalMark());
-
-                            break;
-                        }
-                    }
-                }
-
+                if (task)
+                    writeQueryConditionCache(*task);
                 task = algorithm->getNewTask(*pool, task.get());
             }
 
@@ -483,10 +443,63 @@ ChunkAndProgress MergeTreeSelectProcessor::read()
                 pending_virtual_row.emplace(std::move(vrow));
         }
 
+        /// Its readers and their buffers go now, not when the next block is asked for, which may be much later.
+        if (release_finished_task && algorithm->needNewTask(*task))
+        {
+            writeQueryConditionCache(*task);
+            task.reset();
+        }
+
         return result;
     }
 
     return {Chunk(), 0, 0, true, {}};
+}
+
+void MergeTreeSelectProcessor::writeQueryConditionCache(MergeTreeReadTask & finished_task)
+{
+    /// Update the query condition cache for filters in PREWHERE stage.
+    /// Skip the write when a reader earlier in the chain (skip-index or projection-index)
+    /// could have filtered marks before PREWHERE saw them, to avoid attributing those
+    /// marks to the PREWHERE predicate hash. See Issue #104781.
+    /// On-fly mutations and patch parts filter rows ahead of PREWHERE for the same reason.
+    /// A row-level security filter is also prepended before PREWHERE, yet this write keys
+    /// only on the query PREWHERE hash, so a mark hidden by a row policy must not be attributed
+    /// to the PREWHERE predicate (a later query without the policy would skip rows it should see).
+    if (reader_settings.use_query_condition_cache && prewhere_info
+        && !finished_task.readersChainCanSkipMarksBeforePrewhere()
+        && !finished_task.appliesMutationsBeforePrewhere()
+        && !row_level_filter
+        /// QueryConditionCache needs the concrete part's storage UUID; skip for borrowed parts.
+        && finished_task.getInfo().data_part_info->getDataPart())
+    {
+        for (const auto * output : prewhere_info->prewhere_actions.getOutputs())
+        {
+            if (output->result_name == prewhere_info->prewhere_column_name)
+            {
+                if (!VirtualColumnUtils::isDeterministic(output))
+                    continue;
+
+                auto query_condition_cache = Context::getGlobalContextInstance()->getQueryConditionCache();
+                const auto & data_part_info = finished_task.getInfo().data_part_info;
+
+                String part_name = data_part_info->isProjectionPart()
+                    ? fmt::format("{}:{}", data_part_info->getParentPartName(), data_part_info->getPartName())
+                    : data_part_info->getPartName();
+                query_condition_cache->write(
+                    /// QueryConditionCache is a coordinator feature; concrete part present here.
+                    data_part_info->getDataPart()->storage.getStorageID().uuid,
+                    part_name,
+                    queryConditionCacheHash(output->getHash(), reader_settings.query_condition_cache_settings_salt),
+                    prewhere_info->prewhere_actions.getNames()[0],
+                    finished_task.getPrewhereUnmatchedMarks(),
+                    data_part_info->getIndexGranularity().getMarksCount(),
+                    data_part_info->getIndexGranularity().hasFinalMark());
+
+                break;
+            }
+        }
+    }
 }
 
 /// Cancels all internal operations for this select processor, including cancelling any ongoing index reads.

@@ -49,7 +49,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         });
         addSettingsChanges(settings_changes_history, "26.9",
         {
-            {"read_in_order_split_by_key_prefix_in_read_ahead_rows", 16384, 16384, "New setting: rows each value's stream reads ahead with `read_in_order_split_by_key_prefix_in`."},
+            {"read_in_order_split_by_key_prefix_in_read_ahead_rows", 65536, 65536, "New setting: rows each value's stream reads ahead with `read_in_order_split_by_key_prefix_in`."},
             {"read_in_order_split_by_key_prefix_in", false, false, "New setting to read in order of the rest of the sorting key with `WHERE <first key column> IN (...)`."},
             {"ai_function_max_input_tokens_per_query", 1000000, 0, "The AI function per-query quotas are disabled by default: 0 means no limit."},
             {"ai_function_max_output_tokens_per_query", 500000, 0, "The AI function per-query quotas are disabled by default: 0 means no limit."},
