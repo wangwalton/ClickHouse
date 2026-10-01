@@ -37,6 +37,9 @@ workloads = {
 order = 'received_at, tie, market_id'
 tables = {'universe': ('mf.pcu_mf', 'mf.pcu_tf', 'mf.pcu_mb1', 'mf.pcu_mb10'),
           'subset': ('mf.polymarket_ws_price_change', 'mf.pc_tf', 'mf.pc_mb1', 'mf.pc_mb10')}[data]
+# MF_TABLE=<suffix>: the market-first table of another format, e.g. b8k reads mf.pc_b8k / mf.pcu_b8k.
+if os.environ.get('MF_TABLE'):
+    tables = (f"mf.{'pcu' if data == 'universe' else 'pc'}_{os.environ['MF_TABLE']}",) + tables[1:]
 b1 = 'toStartOfMinute(received_at)'
 b10 = 'toStartOfInterval(received_at, INTERVAL 10 MINUTE)'
 patterns = {  # name → (table, ORDER BY, settings, bucket expression for pruning)

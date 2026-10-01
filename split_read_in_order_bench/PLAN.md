@@ -115,7 +115,13 @@ Beyond the plan, found by profiling:
 - Read-ahead 65,536 rows (was 16,384): readers paced 16k rows ahead of the merge left a 0.8 s tail
   at 3 threads on NRA A 24 h.
 
-Not reached: memory on wide 24 h reads is 1.5–2× the sort (README "Floors").
+Not reached in that round: memory on wide 24 h reads was 1.5–2× the sort.
 
 Afterwards: the stock sort as 8 concurrent time slices reaches 12.4 s on 5,000 random / 24 h (patch
-8.5 s, one-query sort 34.3 s), so the patch stays parked (README "Status").
+8.5 s, one-query sort 34.3 s).
+
+Memory round (same day): the 2× came from open readers holding a 64 KiB decompressed block per
+column, a 16 B stored key per buffered row, and a read-ahead larger than a quiet market's day; not
+from rows held twice (the top level held 2–12% of rows). Keys are now packed from the columns,
+file buffers capped, the read-ahead shared by bytes, and the table uses 8 KiB blocks: 5,000 random /
+24 h 7.1 s, 2.25 GiB (sort 33.5 s, 3.9 GiB; time slices 12.4 s, 4.3 GiB). README "Results".
