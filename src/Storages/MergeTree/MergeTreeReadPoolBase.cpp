@@ -1,4 +1,5 @@
 #include <Storages/MergeTree/MergeTreeReadPoolBase.h>
+#include <unordered_map>
 
 #include <Common/ProfileEvents.h>
 #include <Core/Settings.h>
@@ -342,11 +343,29 @@ void MergeTreeReadPoolBase::fillPerPartInfos(const Settings & settings)
     per_part_infos.reserve(parts_ranges.size());
     is_part_on_remote_disk.reserve(parts_ranges.size());
 
+    /// Several entries may read disjoint ranges of one part (reading split by key prefix values). Nothing in
+    /// the info depends on the ranges, so they share one.
+    std::unordered_map<const IMergeTreeDataPart *, size_t> first_entry_of_part;
     for (const auto & part_with_ranges : parts_ranges)
     {
 #ifndef NDEBUG
         assertSortedAndNonIntersecting(part_with_ranges.ranges);
 #endif
+        const auto [it, inserted] = first_entry_of_part.try_emplace(part_with_ranges.data_part.get(), per_part_infos.size());
+        if (!inserted)
+        {
+            const auto & shared = per_part_infos[it->second];
+            if (shared->part_index_in_query != part_with_ranges.part_index_in_query
+                || shared->part_starting_offset_in_query != part_with_ranges.part_starting_offset_in_query
+                || shared->parent_part != part_with_ranges.parent_part)
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Entries of part {} differ in index or parent", part_with_ranges.data_part->name);
+            if (!shared->patch_parts.empty())
+                ranges_in_patch_parts.addPart(part_with_ranges.data_part, shared->patch_parts, part_with_ranges.ranges);
+            is_part_on_remote_disk.push_back(is_part_on_remote_disk[it->second]);
+            per_part_infos.push_back(shared);
+            continue;
+        }
+
         MergeTreeReadTaskInfo read_task_info = buildReadTaskInfo(part_with_ranges, settings);
         if (!read_task_info.patch_parts.empty())
             ranges_in_patch_parts.addPart(part_with_ranges.data_part, read_task_info.patch_parts, part_with_ranges.ranges);

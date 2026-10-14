@@ -127,9 +127,14 @@ public:
         const MergeTreeReaderSettings & reader_settings_,
         MergeTreeIndexBuildContextPtr merge_tree_index_build_context_ = {},
         LazyMaterializingRowsPtr lazy_materializing_rows_ = {},
-        const ColumnsDescription * columns_ = nullptr);
+        const ColumnsDescription * columns_ = nullptr,
+        /// A processor over the same pool and filters: its PREWHERE actions and header are reused instead of rebuilt.
+        const MergeTreeSelectProcessor * same_as_ = nullptr);
 
     String getName() const;
+
+    /// Drop a finished task, and so its readers and their buffers, right after its last block.
+    void setReleaseFinishedTask() { release_finished_task = true; }
 
     static Block transformHeader(
         Block block,
@@ -170,6 +175,9 @@ public:
 
 private:
     friend class SingleProjectionIndexReader;
+
+    void writeQueryConditionCache(MergeTreeReadTask & finished_task);
+    bool release_finished_task = false;
 
     const MergeTreeReadPoolPtr pool;
     const MergeTreeSelectAlgorithmPtr algorithm;
