@@ -178,6 +178,49 @@ Next for memory: smaller blocks for quiet readers with time pacing (read when th
 reader's last row, not when its rows run low), and merging quiet markets' readers that share
 granules into one reader per stretch of the part.
 
+## History: rounds and what they bought
+
+5,000 random markets, 24 h, server time and peak memory:
+
+| round | commit | patch | note |
+|---|---|---|---|
+| during the optimization round, before the parallel top merge and reader freeing | — | 15.7 s, 9.6 GiB (64 KiB blocks) | one top merge |
+| optimization round, 2026-10-01 | `a66bd5534` | 8.5 s, 7.6 GiB (64 KiB) | time won; memory ~2× the sort |
+| memory round, 2026-10-01 | `11845f685` | 9.1 s, 4.9 GiB (64 KiB); **7.1 s, 2.25 GiB (8 KiB)** | needs the 8 KiB table setting |
+| stock sort, one query | — | 33.5–36.5 s, 3.9 GiB | |
+| stock sort, 8 concurrent 3 h slices | — | 12.4 s, 4.3 GiB summed | best stock option |
+
+Why memory was ~2× the sort after the optimization round: the read-ahead (65,536 rows per market)
+was more than an average market's day (156 M rows / 5,000 ≈ 31 k), so it buffered almost every row;
+the first-level merges' largest buffers summed to 124 M rows (80% of the rows), and rows gathered
+by a first-level merge waited for the frontier while their source chunks stayed buffered, so most
+rows were held twice (~50 B/row against the sort's ~27). The memory round fixed both (packed keys
+not stored, byte-shared read-ahead, file buffers capped, 8 KiB blocks).
+
+### What each change bought (optimization round, 2026-10-01)
+
+| change | measured on | before → after |
+|---|---|---|
+| one pool, one PREWHERE/header for all readers | rand5000 1 h setup | 1.8 s → < 0.1 s |
+| gather through raw pointers incl. Nullable | rand5000 1 h gather | 470 → ~60 ns/row |
+| reading groups per part (shared granules read once) | rows read, 24 h | −29% vs per-value readers |
+| slices sized to the threads (was 16 granules) | 1 market 24 h blocks decompressed | 5,971 → 3,375 (367 → 205 MB) |
+| merge emits runs (gallop + binary search) | 1 market 24 h merge | 63 → 1 ms |
+| 4 parallel gathers, no zero-fill | 1 market 24 h | 0.33 → 0.16–0.21 s |
+| free a reader right after its last block | rand5000 24 h memory | 9.6 → 8.3 GiB |
+| buffer only output columns (not ALIAS inputs, not the merge's key copy) | rand5000 3 h / 24 h memory | 1.38 → 0.9 GiB / 8.3 → 5.8 GiB |
+| per-value range lookup by binary search (planning) | NRA A 24 h | 2.55 → 2.0–2.1 s |
+| parallel top merge (frontier → tasks → 8 workers) | rand5000 1 h / 24 h, top500 24 h | 1.10 → 0.68 s / 15.7 → 8.9 s / 7.4 → 3.9 s |
+| at most 4 × workers tasks waiting | rand5000 24 h memory | 7.2 → 6.0 GiB |
+| read-ahead 16,384 → 65,536 rows | NRA A 24 h / top500 3 h / NRA B 24 h | 2.0 → 1.6 s / 1.19 → 0.95 s / 5.3 → 4.6 s, memory +10–90% |
+
+Tried, no gain: software prefetch in the gather (419 vs 386 ms); 8-granule reading groups (same
+memory, slower); 4,096-row read-ahead (rand5000 24 h 15.7 → 19.3 s for −10% memory); slicing values
+over half a thread's share of granules when many are busy (none qualified on NRA A); 8 lazy readers
+ahead per group instead of 1 (no change). Stock-sort settings (3 h universe, top500 / rand5000):
+`max_block_size = 262144` 2.78 / 5.46 s, `max_bytes_before_remerge_sort = 0` 2.90 / 4.24 s,
+`max_threads = 32` 3.02 / 5.09 s, against 2.87 / 4.59 s default.
+
 ## Status
 
 The patch beats the market-first sort on time on every workload but the smallest (within 20 ms),
@@ -186,6 +229,12 @@ and on memory on every long or busy read; on short wide reads of quiet markets i
 is slower and holds more than the patch on 8 KiB blocks (7.1 s, 2.25 GiB). On the 64 KiB-block table
 the patch holds more than the sort on wide 24 h reads, so the memory gain needs the 8 KiB table
 setting. Details of the time-sliced sort: markets-v2 `docs/replay-regions/measurements.md`.
+
+Not deployed. markets-v2 prod (germany-hetzner, as of 2026-10-14) runs stock ClickHouse 26.8; its
+replay reads one sorted query per day. Its ws tables use 16 KiB compressed blocks (markets-v2 #375:
+the patched read of 5,000 markets × 24 h went 4.6 → 2.6 GiB against 64 KiB); the final build was not
+measured at 16 KiB. Using the patch means running this build as the replay server, rebased on
+every upgrade.
 
 ## Next steps
 
@@ -217,6 +266,15 @@ ninja -C build clickhouse
 
 The embedded compiler (JIT) is off, so sort comparisons in the stock full sort are slower than in
 a default build; the patched merge does not use it.
+
+## Host cost
+
+On the germany-hetzner host that also runs prod (2026-10-14): source and build 20 GiB in
+`/var/tmp/ch-src` (contrib 9.9, build 5.7, `.git` 3.1), test server data 34 GiB in `/var/tmp/chtest`.
+An idle test server costs ~0.4 core, and its 16 io_uring rings make the host report ~70% iowait
+(16 tasks in `procs_blocked`) with the disk idle: pausing it took iowait 70% → 0%. Stop it when not
+benchmarking. `mf-load.sh` built the bench data from the pre-migration prod tables through the
+removed `.wt/ch-storage-format` worktree; it needs updating before the data can be rebuilt.
 
 ## Files
 
